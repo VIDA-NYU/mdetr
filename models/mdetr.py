@@ -3,28 +3,25 @@
 """
 MDETR model and criterion classes.
 """
-from typing import Dict, Optional
+from typing import Optional
 
 import torch
 import torch.distributed
 import torch.nn.functional as F
 from torch import nn
 
-import util.dist as dist
-from util import box_ops
-from util.metrics import accuracy
-from util.misc import NestedTensor, interpolate
+from util.misc import NestedTensor
 
 from .backbone import build_backbone
 from .matcher import build_matcher
-from .postprocessors import build_postprocessors
-from .segmentation import DETRsegm, dice_loss, sigmoid_focal_loss
+from .segmentation import DETRsegm
 from .transformer import build_transformer
 from .criterion import SetCriterion, ContrastiveCriterion, QACriterionGQA, QACriterionClevr
 
 
 class MDETR(nn.Module):
     """ This is the MDETR module that performs modulated object detection """
+    qa_head = None
 
     def __init__(
         self,
@@ -86,26 +83,110 @@ class MDETR(nn.Module):
         self.qa_dataset = qa_dataset
         self.split_qa_heads = split_qa_heads
         if qa_dataset is not None:
-            if split_qa_heads:
-                self.answer_type_head = nn.Linear(hidden_dim, 5)
-                # TODO: make this more general
-                if qa_dataset == "gqa":
-                    self.answer_rel_head = nn.Linear(hidden_dim, 1594)
-                    self.answer_obj_head = nn.Linear(hidden_dim, 3)
-                    self.answer_global_head = nn.Linear(hidden_dim, 111)
-                    self.answer_attr_head = nn.Linear(hidden_dim, 403)
-                    self.answer_cat_head = nn.Linear(hidden_dim, 678)
-                elif qa_dataset == "clevr":
-                    self.answer_type_head = nn.Linear(hidden_dim, 3)
-                    self.answer_binary_head = nn.Linear(hidden_dim, 1)
-                    self.answer_attr_head = nn.Linear(hidden_dim, 15)
-                    self.answer_reg_head = MLP(hidden_dim, hidden_dim, 20, 3)
+            if qa_dataset == "gqa":
+                if split_qa_heads:
+                    self.qa_head = SplitGQAAnswerHead(hidden_dim)
                 else:
-                    assert False, f"Invalid qa dataset {qa_dataset}"
+                    self.qa_head = GQAAnswerHead(hidden_dim)
+            elif qa_dataset == "clevr":
+                assert not split_qa_heads, "Clevr QA is not supported with unified head"
+                self.qa_head = ClevrAnswerHead(hidden_dim)
             else:
-                # TODO: make this more general
-                assert qa_dataset == "gqa", "Clevr QA is not supported with unified head"
-                self.answer_head = nn.Linear(hidden_dim, 1853)
+                assert False, f"Invalid qa dataset {qa_dataset}"
+
+    def _encode(self, samples: NestedTensor, captions):
+        if not isinstance(samples, NestedTensor):
+            samples = NestedTensor.from_tensor_list(samples)
+        features, pos = self.backbone(samples)
+        src, mask = features[-1].decompose()
+        query_embed = self.query_embed.weight
+        if self.qa_dataset is not None:
+            query_embed = torch.cat([query_embed, self.qa_embed.weight], 0)
+        memory_cache = self.transformer(
+            self.input_proj(src),
+            mask,
+            query_embed,
+            pos[-1],
+            captions,
+            encode_and_save=True,
+            text_memory=None,
+            img_memory=None,
+            text_attention_mask=None,
+        )
+
+        if self.contrastive_loss:
+            memory_cache["text_pooled_op"] = self.contrastive_projection_text(memory_cache["text_pooled_op"])
+            memory_cache["img_pooled_op"] = self.contrastive_projection_image(memory_cache["img_pooled_op"])
+
+        return memory_cache
+
+    def _decode(self, mask, query_embed, pos_embed, img_memory, text_memory, text_memory_resized, text_attention_mask, tokenized):
+        hs = self.transformer(
+            mask=mask,
+            query_embed=query_embed,
+            pos_embed=pos_embed,
+            encode_and_save=False,
+            text_memory=text_memory_resized,
+            img_memory=img_memory,
+            text_attention_mask=text_attention_mask,
+        )
+        out = {}
+
+        # question answering
+        if self.qa_head is not None:
+            qa_output, hs = self.qa_head(hs)
+            out.update(qa_output)
+
+        # predicted boxes
+        outputs_class = self.class_embed(hs)
+        outputs_coord = self.bbox_embed(hs).sigmoid()
+        out.update({
+            "pred_logits": outputs_class[-1],
+            "pred_boxes": outputs_coord[-1],
+        })
+        
+        # 
+        outputs_isfinal = None
+        if self.isfinal_embed is not None:
+            outputs_isfinal = self.isfinal_embed(hs)
+            out["pred_isfinal"] = outputs_isfinal[-1]
+
+        # 
+        proj_queries, proj_tokens = None, None
+        if self.contrastive_align_loss:
+            proj_queries = F.normalize(self.contrastive_align_projection_image(hs), p=2, dim=-1)
+            proj_tokens = F.normalize(self.contrastive_align_projection_text(text_memory).transpose(0, 1), p=2, dim=-1)
+            out.update({
+                "proj_queries": proj_queries[-1],
+                "proj_tokens": proj_tokens,
+                "tokenized": tokenized,
+            })
+        if self.aux_loss:
+            if self.contrastive_align_loss:
+                assert proj_tokens is not None and proj_queries is not None
+                out["aux_outputs"] = [
+                    {
+                        "pred_logits": a,
+                        "pred_boxes": b,
+                        "proj_queries": c,
+                        "proj_tokens": proj_tokens,
+                        "tokenized": tokenized,
+                    }
+                    for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], proj_queries[:-1])
+                ]
+            else:
+                out["aux_outputs"] = [
+                    {
+                        "pred_logits": a,
+                        "pred_boxes": b,
+                    }
+                    for a, b in zip(outputs_class[:-1], outputs_coord[:-1])
+                ]
+            if outputs_isfinal is not None:
+                assert len(outputs_isfinal[:-1]) == len(out["aux_outputs"])
+                for i in range(len(outputs_isfinal[:-1])):
+                    out["aux_outputs"][i]["pred_isfinal"] = outputs_isfinal[i]
+        return out
 
     def forward(self, samples: NestedTensor, captions, encode_and_save=True, memory_cache=None):
         """The forward expects a NestedTensor, which consists of:
@@ -122,123 +203,80 @@ class MDETR(nn.Module):
            - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
                             dictionnaries containing the two above keys for each decoder layer.
         """
-        if not isinstance(samples, NestedTensor):
-            samples = NestedTensor.from_tensor_list(samples)
-
         if encode_and_save:
             assert memory_cache is None
-            features, pos = self.backbone(samples)
-            src, mask = features[-1].decompose()
-            query_embed = self.query_embed.weight
-            if self.qa_dataset is not None:
-                query_embed = torch.cat([query_embed, self.qa_embed.weight], 0)
-            memory_cache = self.transformer(
-                self.input_proj(src),
-                mask,
-                query_embed,
-                pos[-1],
-                captions,
-                encode_and_save=True,
-                text_memory=None,
-                img_memory=None,
-                text_attention_mask=None,
-            )
-
-            if self.contrastive_loss:
-                memory_cache["text_pooled_op"] = self.contrastive_projection_text(memory_cache["text_pooled_op"])
-                memory_cache["img_pooled_op"] = self.contrastive_projection_image(memory_cache["img_pooled_op"])
-
-            return memory_cache
-
+            return self._encode(samples, captions)
         else:
             assert memory_cache is not None
-            hs = self.transformer(
-                mask=memory_cache["mask"],
-                query_embed=memory_cache["query_embed"],
-                pos_embed=memory_cache["pos_embed"],
-                encode_and_save=False,
-                text_memory=memory_cache["text_memory_resized"],
-                img_memory=memory_cache["img_memory"],
-                text_attention_mask=memory_cache["text_attention_mask"],
-            )
-            out = {}
-            if self.qa_dataset is not None:
-                if self.split_qa_heads:
-                    if self.qa_dataset == "gqa":
-                        answer_embeds = hs[0, :, -6:]
-                        hs = hs[:, :, :-6]
-                        out["pred_answer_type"] = self.answer_type_head(answer_embeds[:, 0])
-                        out["pred_answer_obj"] = self.answer_obj_head(answer_embeds[:, 1])
-                        out["pred_answer_rel"] = self.answer_rel_head(answer_embeds[:, 2])
-                        out["pred_answer_attr"] = self.answer_attr_head(answer_embeds[:, 3])
-                        out["pred_answer_cat"] = self.answer_cat_head(answer_embeds[:, 4])
-                        out["pred_answer_global"] = self.answer_global_head(answer_embeds[:, 5])
-                    elif self.qa_dataset == "clevr":
-                        answer_embeds = hs[0, :, -4:]
-                        hs = hs[:, :, :-4]
-                        out["pred_answer_type"] = self.answer_type_head(answer_embeds[:, 0])
-                        out["pred_answer_binary"] = self.answer_binary_head(answer_embeds[:, 1]).squeeze(-1)
-                        out["pred_answer_reg"] = self.answer_reg_head(answer_embeds[:, 2])
-                        out["pred_answer_attr"] = self.answer_attr_head(answer_embeds[:, 3])
-                    else:
-                        assert False, f"Invalid qa dataset {self.qa_dataset}"
+            return self._decode(**memory_cache)
 
-                else:
-                    answer_embeds = hs[0, :, -1]
-                    hs = hs[:, :, :-1]
-                    out["pred_answer"] = self.answer_head(answer_embeds)
+    # # convenience wrappers so its clear how to call things
+    # def encode(self, samples: NestedTensor, captions):
+    #     return self(samples, captions)
 
-            outputs_class = self.class_embed(hs)
-            outputs_coord = self.bbox_embed(hs).sigmoid()
-            out.update(
-                {
-                    "pred_logits": outputs_class[-1],
-                    "pred_boxes": outputs_coord[-1],
-                }
-            )
-            outputs_isfinal = None
-            if self.isfinal_embed is not None:
-                outputs_isfinal = self.isfinal_embed(hs)
-                out["pred_isfinal"] = outputs_isfinal[-1]
-            proj_queries, proj_tokens = None, None
-            if self.contrastive_align_loss:
-                proj_queries = F.normalize(self.contrastive_align_projection_image(hs), p=2, dim=-1)
-                proj_tokens = F.normalize(
-                    self.contrastive_align_projection_text(memory_cache["text_memory"]).transpose(0, 1), p=2, dim=-1
-                )
-                out.update(
-                    {
-                        "proj_queries": proj_queries[-1],
-                        "proj_tokens": proj_tokens,
-                        "tokenized": memory_cache["tokenized"],
-                    }
-                )
-            if self.aux_loss:
-                if self.contrastive_align_loss:
-                    assert proj_tokens is not None and proj_queries is not None
-                    out["aux_outputs"] = [
-                        {
-                            "pred_logits": a,
-                            "pred_boxes": b,
-                            "proj_queries": c,
-                            "proj_tokens": proj_tokens,
-                            "tokenized": memory_cache["tokenized"],
-                        }
-                        for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], proj_queries[:-1])
-                    ]
-                else:
-                    out["aux_outputs"] = [
-                        {
-                            "pred_logits": a,
-                            "pred_boxes": b,
-                        }
-                        for a, b in zip(outputs_class[:-1], outputs_coord[:-1])
-                    ]
-                if outputs_isfinal is not None:
-                    assert len(outputs_isfinal[:-1]) == len(out["aux_outputs"])
-                    for i in range(len(outputs_isfinal[:-1])):
-                        out["aux_outputs"][i]["pred_isfinal"] = outputs_isfinal[i]
-            return out
+    # def decode(self, memory_cache):
+    #     return self(memory_cache=memory_cache, encode_and_save=False)
+
+    # def full(self, samples: NestedTensor, captions):
+    #     memory_cache = self.encode(samples, captions)
+    #     out = self.decode(memory_cache)
+    #     return dict(memory_cache, **out)
+
+
+
+class GQAAnswerHead(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.answer_head = nn.Linear(hidden_dim, 1853)
+
+    def __call__(self, hs):
+        out = {}
+        answer_embeds = hs[0, :, -1]
+        hs = hs[:, :, :-1]
+        out["pred_answer"] = self.answer_head(answer_embeds)
+        return out, hs
+
+
+class SplitGQAAnswerHead(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.answer_type_head = nn.Linear(hidden_dim, 5)
+        self.answer_rel_head = nn.Linear(hidden_dim, 1594)
+        self.answer_obj_head = nn.Linear(hidden_dim, 3)
+        self.answer_global_head = nn.Linear(hidden_dim, 111)
+        self.answer_attr_head = nn.Linear(hidden_dim, 403)
+        self.answer_cat_head = nn.Linear(hidden_dim, 678)
+
+    def __call__(self, hs):
+        out = {}
+        answer_embeds = hs[0, :, -6:]
+        hs = hs[:, :, :-6]
+        out["pred_answer_type"] = self.answer_type_head(answer_embeds[:, 0])
+        out["pred_answer_obj"] = self.answer_obj_head(answer_embeds[:, 1])
+        out["pred_answer_rel"] = self.answer_rel_head(answer_embeds[:, 2])
+        out["pred_answer_attr"] = self.answer_attr_head(answer_embeds[:, 3])
+        out["pred_answer_cat"] = self.answer_cat_head(answer_embeds[:, 4])
+        out["pred_answer_global"] = self.answer_global_head(answer_embeds[:, 5])
+        return out, hs
+
+class ClevrAnswerHead(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.answer_type_head = nn.Linear(hidden_dim, 5)
+        self.answer_type_head = nn.Linear(hidden_dim, 3)
+        self.answer_binary_head = nn.Linear(hidden_dim, 1)
+        self.answer_attr_head = nn.Linear(hidden_dim, 15)
+        self.answer_reg_head = MLP(hidden_dim, hidden_dim, 20, 3)
+
+    def __call__(self, hs):
+        out = {}
+        answer_embeds = hs[0, :, -4:]
+        hs = hs[:, :, :-4]
+        out["pred_answer_type"] = self.answer_type_head(answer_embeds[:, 0])
+        out["pred_answer_binary"] = self.answer_binary_head(answer_embeds[:, 1]).squeeze(-1)
+        out["pred_answer_reg"] = self.answer_reg_head(answer_embeds[:, 2])
+        out["pred_answer_attr"] = self.answer_attr_head(answer_embeds[:, 3])
+        return out, hs
 
 
 class MLP(nn.Module):
@@ -275,13 +313,9 @@ def build(args):
         ), "Question answering require either gqa or clevr dataset"
         qa_dataset = "gqa" if "gqa" in args.combine_datasets else "clevr"
 
-    backbone = build_backbone(args)
-
-    transformer = build_transformer(args)
-
     model = MDETR(
-        backbone,
-        transformer,
+        build_backbone(args),
+        build_transformer(args),
         num_classes=num_classes,
         num_queries=args.num_queries,
         aux_loss=args.aux_loss,
@@ -331,10 +365,11 @@ def build(args):
 
     # TODO this is a hack
     if args.aux_loss:
-        aux_weight_dict = {}
-        for i in range(args.dec_layers - 1):
-            aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
-        weight_dict.update(aux_weight_dict)
+        weight_dict.update({
+            f"{k}_{i}": v 
+            for i in range(args.dec_layers - 1)
+            for k, v in weight_dict.items()
+        })
 
     losses = ["labels", "boxes", "cardinality"]
     if args.masks:
@@ -352,15 +387,13 @@ def build(args):
             eos_coef=args.eos_coef,
             losses=losses,
             temperature=args.temperature_NCE,
-        )
-        criterion.to(device)
+        ).to(device)
 
+    contrastive_criterion = None
     if args.contrastive_loss:
-        contrastive_criterion = ContrastiveCriterion(temperature=args.temperature_NCE)
-        contrastive_criterion.to(device)
-    else:
-        contrastive_criterion = None
+        contrastive_criterion = ContrastiveCriterion(temperature=args.temperature_NCE).to(device)
 
+    qa_criterion = None
     if args.do_qa:
         if qa_dataset == "gqa":
             qa_criterion = QACriterionGQA(split_qa_heads=args.split_qa_heads)
@@ -369,6 +402,4 @@ def build(args):
         else:
             assert False, f"Invalid qa dataset {qa_dataset}"
         qa_criterion.to(device)
-    else:
-        qa_criterion = None
     return model, criterion, contrastive_criterion, qa_criterion, weight_dict
