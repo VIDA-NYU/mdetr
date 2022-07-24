@@ -3,8 +3,6 @@
 """
 MDETR model and criterion classes.
 """
-from typing import Dict, Optional
-
 import torch
 import torch.distributed
 import torch.nn.functional as F
@@ -12,16 +10,8 @@ from torch import nn
 
 import util.dist as dist
 from util import box_ops
-from util.metrics import accuracy
 from util.misc import NestedTensor, interpolate
-
-from .backbone import build_backbone
-from .matcher import build_matcher
-from .postprocessors import build_postprocessors
-from .segmentation import DETRsegm, dice_loss, sigmoid_focal_loss
-from .transformer import build_transformer
-
-
+from .segmentation import dice_loss, sigmoid_focal_loss
 
 
 
