@@ -37,17 +37,19 @@ class Transformer(nn.Module):
         super().__init__()
 
         self.pass_pos_and_query = pass_pos_and_query
-        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout, activation, normalize_before)
-        encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
-        self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
+        self.encoder = TransformerEncoder(
+            TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout, activation, normalize_before), 
+            num_encoder_layers, 
+            nn.LayerNorm(d_model) if normalize_before else None)
 
-        decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation, normalize_before)
-        decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(
-            decoder_layer, num_decoder_layers, decoder_norm, return_intermediate=return_intermediate_dec
+            TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation, normalize_before), 
+            num_decoder_layers, 
+            nn.LayerNorm(d_model), 
+            return_intermediate=return_intermediate_dec
         )
 
-        self.CLS = nn.Embedding(1, d_model) if contrastive_loss else None
+        self.cls_embed = nn.Embedding(1, d_model) if contrastive_loss else None
 
         self._reset_parameters()
 
@@ -61,17 +63,7 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def _encode(
-        self,
-        src,
-        mask,
-        query_embed,
-        pos_embed: torch.Tensor,
-        text,
-        text_memory,
-        img_memory,
-        text_attention_mask,
-    ):
+    def _encode(self, src, text, mask, query_embed, pos_embed: torch.Tensor):
         # flatten NxCxHxW to HWxNxC
         bs, c, h, w = src.shape
         src = src.flatten(2).permute(2, 0, 1)
@@ -80,9 +72,9 @@ class Transformer(nn.Module):
         mask = mask.flatten(1)
 
         device = src.device
-        if self.CLS is not None:
+        if self.cls_embed is not None:
             # We add a CLS token to the image features, to be used for contrastive loss
-            src = torch.cat((self.CLS.weight.view(1, 1, -1).repeat(1, bs, 1), src))
+            src = torch.cat((self.cls_embed.weight.view(1, 1, -1).repeat(1, bs, 1), src))
             # Adding zeros as the first token in the sequence to be compatible with the CLS token
             pos_embed = torch.cat((torch.zeros(1, bs, self.d_model, device=device), pos_embed))
             # Adding one mask item to the beginning of the mask to be compatible with CLS token
@@ -91,7 +83,7 @@ class Transformer(nn.Module):
         if self.pass_pos_and_query:
             tgt = torch.zeros_like(query_embed)
         else:
-            src, tgt, query_embed, pos_embed = src + 0.1 * pos_embed, query_embed, None, None
+            src, tgt = src + 0.1 * pos_embed, query_embed
 
         text_attention_mask, text_memory_resized, tokenized, encoded_text = self.text_encoder(text, src.device)
 
@@ -102,7 +94,7 @@ class Transformer(nn.Module):
         # Pad the pos_embed with 0 so that the addition will be a no-op for the text tokens
         pos_embed = torch.cat([pos_embed, torch.zeros_like(text_memory_resized)], dim=0)
 
-        img_memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        img_memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed if self.pass_pos_and_query else None)
         text_memory = img_memory[-len(text_memory_resized) :]
 
         assert img_memory.shape[1] == text_memory.shape[1] == tgt.shape[1]
@@ -110,12 +102,12 @@ class Transformer(nn.Module):
             "text_memory_resized": text_memory_resized,
             "text_memory": text_memory,
             "img_memory": img_memory,
-            "text_pooled_op": encoded_text.pooler_output if self.CLS is not None else None,
-            "img_pooled_op": img_memory[0] if self.CLS is not None else None,  # Return the CLS token
+            "text_pooled_op": encoded_text.pooler_output if self.cls_embed is not None else None,
+            "img_pooled_op": img_memory[0] if self.cls_embed is not None else None,  # Return the CLS token
             "mask": mask,
             "text_attention_mask": text_attention_mask,
-            "pos_embed": pos_embed,
-            "query_embed": query_embed,
+            "pos_embed": pos_embed if self.pass_pos_and_query else None,
+            "query_embed": query_embed if self.pass_pos_and_query else None,
             "tokenized": tokenized,
         }
         return memory_cache
@@ -133,32 +125,31 @@ class Transformer(nn.Module):
         if self.pass_pos_and_query:
             tgt = torch.zeros_like(query_embed)
         else:
-            src, tgt, query_embed, pos_embed = src + 0.1 * pos_embed, query_embed, None, None
+            src, tgt = src + 0.1 * pos_embed, query_embed
 
         assert img_memory.shape[1] == text_memory.shape[1] == tgt.shape[1]
-
         hs = self.decoder(
             tgt,
             img_memory,
             text_memory,
             memory_key_padding_mask=mask,
             text_memory_key_padding_mask=text_attention_mask,
-            pos=pos_embed,
-            query_pos=query_embed,
+            pos=pos_embed if self.pass_pos_and_query else None,
+            query_pos=query_embed if self.pass_pos_and_query else None,
         )
         return hs.transpose(1, 2)
 
     def forward(
         self,
-        src=None,
-        mask=None,
-        query_embed=None,
-        pos_embed=None,
-        text=None,
-        encode_and_save=True,
+        src,
+        mask,
+        query_embed,
+        pos_embed,
         text_memory=None,
         img_memory=None,
         text_attention_mask=None,
+        text=None,
+        encode_and_save=True,
     ):
         if encode_and_save:
             return self._encode(
@@ -167,9 +158,6 @@ class Transformer(nn.Module):
                 query_embed=query_embed,
                 pos_embed=pos_embed,
                 text=text,
-                text_memory=text_memory,
-                img_memory=img_memory,
-                text_attention_mask=text_attention_mask,
             )
 
         else:
