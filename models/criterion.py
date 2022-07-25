@@ -12,7 +12,7 @@ import util.dist as dist
 from util import box_ops
 from util.misc import NestedTensor, interpolate
 from .segmentation import dice_loss, sigmoid_focal_loss
-
+from .matcher import build_matcher
 
 
 class ContrastiveCriterion(nn.Module):
@@ -467,3 +467,43 @@ class SetCriterion(nn.Module):
                     losses.update(l_dict)
 
         return losses
+
+
+
+def build_criterion(args, qa_dataset):
+    device = torch.device(args.device)
+
+    losses = ["labels", "boxes", "cardinality"]
+    if args.masks:
+        losses += ["masks"]
+    if args.predict_final:
+        losses += ["isfinal"]
+    if args.contrastive_align_loss:
+        losses += ["contrastive_align"]
+
+    matcher = build_matcher(args)
+    criterion = None
+    if not args.no_detection:
+        criterion = SetCriterion(
+            args.num_classes,
+            matcher=matcher,
+            eos_coef=args.eos_coef,
+            losses=losses,
+            temperature=args.temperature_NCE,
+        ).to(device)
+
+    contrastive_criterion = None
+    if args.contrastive_loss:
+        contrastive_criterion = ContrastiveCriterion(temperature=args.temperature_NCE).to(device)
+
+    qa_criterion = None
+    if args.do_qa:
+        if qa_dataset == "gqa":
+            qa_criterion = QACriterionGQA(split_qa_heads=args.split_qa_heads)
+        elif qa_dataset == "clevr":
+            qa_criterion = QACriterionClevr()
+        else:
+            assert False, f"Invalid qa dataset {qa_dataset}"
+        qa_criterion.to(device)
+
+    return criterion, contrastive_criterion, qa_criterion

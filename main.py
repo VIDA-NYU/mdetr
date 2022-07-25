@@ -115,6 +115,12 @@ def get_args_parser():
         default="roberta-base",
         choices=("roberta-base", "distilroberta-base", "roberta-large"),
     )
+    parser.add_argument(
+        "--num_classes",
+        type=int,
+        default=255,
+        help="number of classes ??? leave constant probably.",
+    )
 
     # Backbone
     parser.add_argument(

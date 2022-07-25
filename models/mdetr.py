@@ -13,10 +13,10 @@ from torch import nn
 from util.misc import NestedTensor
 
 from .backbone import build_backbone
-from .matcher import build_matcher
+# from .matcher import build_matcher
 from .segmentation import DETRsegm
 from .transformer import build_transformer
-from .criterion import SetCriterion, ContrastiveCriterion, QACriterionGQA, QACriterionClevr
+from .criterion import build_criterion
 
 
 class MDETR(nn.Module):
@@ -104,14 +104,11 @@ class MDETR(nn.Module):
             query_embed = torch.cat([query_embed, self.qa_embed.weight], 0)
         memory_cache = self.transformer(
             self.input_proj(src),
-            mask,
-            query_embed,
-            pos[-1],
-            captions,
+            mask=mask,
+            query_embed=query_embed,
+            pos_embed=pos[-1],
+            text=captions,
             encode_and_save=True,
-            text_memory=None,
-            img_memory=None,
-            text_attention_mask=None,
         )
 
         if self.contrastive_loss:
@@ -295,28 +292,16 @@ class MLP(nn.Module):
 
 
 def build(args):
-    num_classes = 255
-    device = torch.device(args.device)
-
     assert not args.masks or args.mask_model != "none"
 
-    qa_dataset = None
-    if args.do_qa:
-        assert not (
-            ("clevr" in args.combine_datasets or "clevr_question" in args.combine_datasets)
-            and "gqa" in args.combine_datasets
-        ), "training GQA and CLEVR simultaneously is not supported"
-        assert (
-            "clevr_question" in args.combine_datasets
-            or "clevr" in args.combine_datasets
-            or "gqa" in args.combine_datasets
-        ), "Question answering require either gqa or clevr dataset"
-        qa_dataset = "gqa" if "gqa" in args.combine_datasets else "clevr"
+    qa_dataset = validate_qa_dataset_choice(args)
+    criterion, contrastive_criterion, qa_criterion = build_criterion(args, qa_dataset)
+    weight_dict = build_weight_dict(args, qa_dataset)
 
     model = MDETR(
         build_backbone(args),
         build_transformer(args),
-        num_classes=num_classes,
+        num_classes=args.num_classes,
         num_queries=args.num_queries,
         aux_loss=args.aux_loss,
         contrastive_hdim=args.contrastive_loss_hdim,
@@ -330,9 +315,27 @@ def build(args):
         model = DETRsegm(
             model,
             mask_head=args.mask_model,
-            freeze_detr=(args.frozen_weights is not None),
-        )
-    matcher = build_matcher(args)
+            freeze_detr=(args.frozen_weights is not None))
+    return model, criterion, contrastive_criterion, qa_criterion, weight_dict
+
+
+def validate_qa_dataset_choice(args):
+    qa_dataset = None
+    if args.do_qa:
+        assert not (
+            ("clevr" in args.combine_datasets or "clevr_question" in args.combine_datasets)
+            and "gqa" in args.combine_datasets
+        ), "training GQA and CLEVR simultaneously is not supported"
+        assert (
+            "clevr_question" in args.combine_datasets
+            or "clevr" in args.combine_datasets
+            or "gqa" in args.combine_datasets
+        ), "Question answering require either gqa or clevr dataset"
+        qa_dataset = "gqa" if "gqa" in args.combine_datasets else "clevr"
+    return qa_dataset
+
+
+def build_weight_dict(args, qa_dataset):
     weight_dict = {"loss_ce": args.ce_loss_coef, "loss_bbox": args.bbox_loss_coef}
     if args.contrastive_loss:
         weight_dict["contrastive_loss"] = args.contrastive_loss_coef
@@ -370,36 +373,4 @@ def build(args):
             for i in range(args.dec_layers - 1)
             for k, v in weight_dict.items()
         })
-
-    losses = ["labels", "boxes", "cardinality"]
-    if args.masks:
-        losses += ["masks"]
-    if args.predict_final:
-        losses += ["isfinal"]
-    if args.contrastive_align_loss:
-        losses += ["contrastive_align"]
-
-    criterion = None
-    if not args.no_detection:
-        criterion = SetCriterion(
-            num_classes,
-            matcher=matcher,
-            eos_coef=args.eos_coef,
-            losses=losses,
-            temperature=args.temperature_NCE,
-        ).to(device)
-
-    contrastive_criterion = None
-    if args.contrastive_loss:
-        contrastive_criterion = ContrastiveCriterion(temperature=args.temperature_NCE).to(device)
-
-    qa_criterion = None
-    if args.do_qa:
-        if qa_dataset == "gqa":
-            qa_criterion = QACriterionGQA(split_qa_heads=args.split_qa_heads)
-        elif qa_dataset == "clevr":
-            qa_criterion = QACriterionClevr()
-        else:
-            assert False, f"Invalid qa dataset {qa_dataset}"
-        qa_criterion.to(device)
-    return model, criterion, contrastive_criterion, qa_criterion, weight_dict
+    return weight_dict
