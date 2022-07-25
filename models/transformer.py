@@ -14,7 +14,7 @@ from typing import List, Optional, cast
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from transformers import RobertaModel, RobertaTokenizerFast
+from .text_encoder import RobertaTextEncoder
 
 
 class Transformer(nn.Module):
@@ -51,20 +51,7 @@ class Transformer(nn.Module):
 
         self._reset_parameters()
 
-        self.tokenizer = RobertaTokenizerFast.from_pretrained(text_encoder_type)
-        self.text_encoder = cast(RobertaModel, RobertaModel.from_pretrained(text_encoder_type))
-
-        if freeze_text_encoder:
-            for p in self.text_encoder.parameters():
-                p.requires_grad_(False)
-
-        self.expander_dropout = 0.1
-        config = self.text_encoder.config
-        self.resizer = FeatureResizer(
-            input_feat_size=config.hidden_size,
-            output_feat_size=d_model,
-            dropout=self.expander_dropout,
-        )
+        self.text_encoder = RobertaTextEncoder(text_encoder_type, freeze_text_encoder)
 
         self.d_model = d_model
         self.nhead = nhead
@@ -73,23 +60,6 @@ class Transformer(nn.Module):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-
-    def _encode_text(self, text, device):
-        if not isinstance(text[0], str):
-            # The text is already encoded, use as is.
-            text_attention_mask, text_memory_resized, tokenized = text
-            return text_attention_mask, text_memory_resized, tokenized, None
-
-        # Encode the text
-        tokenized = self.tokenizer.batch_encode_plus(text, padding="longest", return_tensors="pt").to(device)
-        encoded_text = self.text_encoder(**tokenized)
-        # Transpose memory because pytorch's attention expects sequence first
-        text_memory = encoded_text.last_hidden_state.transpose(0, 1)
-        # Invert attention mask that we get from huggingface because its the opposite in pytorch transformer
-        text_attention_mask = tokenized.attention_mask.ne(1).bool()
-        # Resize the encoder hidden states to be of the same d_model as the decoder
-        text_memory_resized = self.resizer(text_memory)
-        return text_attention_mask, text_memory_resized, tokenized, encoded_text
 
     def _encode(
         self,
@@ -123,7 +93,7 @@ class Transformer(nn.Module):
         else:
             src, tgt, query_embed, pos_embed = src + 0.1 * pos_embed, query_embed, None, None
 
-        text_attention_mask, text_memory_resized, tokenized, encoded_text = self._encode_text(text, src.device)
+        text_attention_mask, text_memory_resized, tokenized, encoded_text = self.text_encoder(text, src.device)
 
         # Concat on the sequence dimension
         src = torch.cat([src, text_memory_resized], dim=0)
@@ -491,27 +461,6 @@ class TransformerDecoderLayer(nn.Module):
             query_pos,
         )
 
-
-class FeatureResizer(nn.Module):
-    """
-    This class takes as input a set of embeddings of dimension C1 and outputs a set of
-    embedding of dimension C2, after a linear transformation, dropout and normalization (LN).
-    """
-
-    def __init__(self, input_feat_size, output_feat_size, dropout, do_ln=True):
-        super().__init__()
-        self.do_ln = do_ln
-        # Object feature encoding
-        self.fc = nn.Linear(input_feat_size, output_feat_size, bias=True)
-        self.layer_norm = nn.LayerNorm(output_feat_size, eps=1e-12)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, encoder_features):
-        x = self.fc(encoder_features)
-        if self.do_ln:
-            x = self.layer_norm(x)
-        output = self.dropout(x)
-        return output
 
 
 def _get_clones(module, N):
