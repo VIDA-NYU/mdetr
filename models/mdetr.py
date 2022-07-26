@@ -117,7 +117,7 @@ class MDETR(nn.Module):
 
         return memory_cache
 
-    def _decode(self, mask, query_embed, pos_embed, img_memory, text_memory, text_memory_resized, text_attention_mask, tokenized):
+    def _decode(self, img_memory, text_memory, text_memory_resized, text_attention_mask, mask, query_embed, pos_embed, tokenized):
         hs = self.transformer(
             mask=mask,
             query_embed=query_embed,
