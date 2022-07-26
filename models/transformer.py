@@ -85,7 +85,7 @@ class Transformer(nn.Module):
         else:
             src, tgt = src + 0.1 * pos_embed, query_embed
 
-        text_attention_mask, text_memory_resized, tokenized, encoded_text = self.text_encoder(text, src.device)
+        text_attention_mask, text_memory_resized, tokenized, pooled_encoded_text = self.text_encoder(text, src.device)
 
         # Concat on the sequence dimension
         src = torch.cat([src, text_memory_resized], dim=0)
@@ -102,7 +102,7 @@ class Transformer(nn.Module):
             "text_memory_resized": text_memory_resized,
             "text_memory": text_memory,
             "img_memory": img_memory,
-            "text_pooled_op": encoded_text.pooler_output if self.cls_embed is not None else None,
+            "text_pooled_op": pooled_encoded_text if self.cls_embed is not None else None,
             "img_pooled_op": img_memory[0] if self.cls_embed is not None else None,  # Return the CLS token
             "mask": mask,
             "text_attention_mask": text_attention_mask,
