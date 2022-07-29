@@ -14,7 +14,7 @@ from torchvision.models._utils import IntermediateLayerGetter
 
 from util.misc import NestedTensor
 
-from .position_encoding import build_position_encoding
+# from .position_encoding import build_position_encoding
 
 
 class FrozenBatchNorm2d(torch.nn.Module):
@@ -161,24 +161,24 @@ class TimmBackbone(nn.Module):
         return out
 
 
-class Joiner(nn.Sequential):
-    def __init__(self, backbone, position_embedding):
-        super().__init__(backbone, position_embedding)
+# class Joiner(nn.Sequential):
+#     def __init__(self, backbone, position_embedding):
+#         self.num_channels = backbone.num_channels
+#         super().__init__(backbone, position_embedding)
 
-    def forward(self, tensor_list):
-        xs = self[0](tensor_list)
-        out = []
-        pos = []
-        for name, x in xs.items():
-            out.append(x)
-            # position encoding
-            pos.append(self[1](x).to(x.tensors.dtype))
+#     def forward(self, tensor_list):
+#         xs = self[0](tensor_list)
+#         out = []
+#         pos = []
+#         for name, x in xs.items():
+#             out.append(x)
+#             # position encoding
+#             pos.append(self[1](x).to(x.tensors.dtype))
 
-        return out, pos
+#         return out, pos
 
 
 def build_backbone(args):
-    position_embedding = build_position_encoding(args)
     train_backbone = args.lr_backbone > 0
     return_interm_layers = args.masks
     if args.backbone[: len("timm_")] == "timm_":
@@ -192,6 +192,4 @@ def build_backbone(args):
         backbone = GroupNormBackbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
     else:
         backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
-    model = Joiner(backbone, position_embedding)
-    model.num_channels = backbone.num_channels
-    return model
+    return backbone

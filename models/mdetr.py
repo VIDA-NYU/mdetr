@@ -3,6 +3,7 @@
 """
 MDETR model and criterion classes.
 """
+from __future__ import annotations
 from typing import Optional
 
 import torch
@@ -17,6 +18,8 @@ from .backbone import build_backbone
 from .segmentation import DETRsegm
 from .transformer import build_transformer
 from .criterion import build_criterion
+from .position_encoding import build_position_encoding
+from .text_encoder import build_text_encoder
 
 
 class MDETR(nn.Module):
@@ -26,9 +29,11 @@ class MDETR(nn.Module):
     def __init__(
         self,
         backbone,
+        text_encoder,
         transformer,
         num_classes,
         num_queries,
+        pos_encode=None,
         aux_loss=False,
         contrastive_hdim=64,
         contrastive_loss=False,
@@ -61,13 +66,21 @@ class MDETR(nn.Module):
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.isfinal_embed = nn.Linear(hidden_dim, 1) if predict_final else None
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+
+        self.backbone = backbone
+        self.text_encoder = text_encoder
+
+        self.pos_encode = pos_encode
+        
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         if qa_dataset is not None:
             nb_heads = 6 if qa_dataset == "gqa" else 4
             self.qa_embed = nn.Embedding(nb_heads if split_qa_heads else 1, hidden_dim)
 
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
-        self.backbone = backbone
+
+        # contrastive loss layers
+
         self.aux_loss = aux_loss
         self.contrastive_loss = contrastive_loss
         if contrastive_loss:
@@ -94,30 +107,50 @@ class MDETR(nn.Module):
             else:
                 assert False, f"Invalid qa dataset {qa_dataset}"
 
-    def _encode(self, samples: NestedTensor, captions):
+    def _encode(self, samples: NestedTensor, captions: list[str]|list[torch.Tensor]):
+        # encode image
         if not isinstance(samples, NestedTensor):
             samples = NestedTensor.from_tensor_list(samples)
-        features, pos = self.backbone(samples)
+        features = self.backbone(samples)
         src, mask = features[-1].decompose()
+
+        # encode text
+        (
+            text_memory, text_attention_mask, tokenized, pooled_encoded_text
+        ) = self.text_encoder(captions, src.device)
+
+        # positional embedding
+        pos_embed = None
+        if self.pos_encode is not None:
+            pos_embed = self.pos_encode(src).to(src.tensors.dtype)
+
+        # query embedding
         query_embed = self.query_embed.weight
         if self.qa_dataset is not None:
             query_embed = torch.cat([query_embed, self.qa_embed.weight], 0)
+
+        # cross-attend text and image
         memory_cache = self.transformer(
             self.input_proj(src),
+            text_memory,
             mask=mask,
+            text_attention_mask=text_attention_mask,
+            pos_embed=pos_embed,
             query_embed=query_embed,
-            pos_embed=pos[-1],
-            text=captions,
             encode_and_save=True,
         )
+        memory_cache['tokenized'] = tokenized
 
         if self.contrastive_loss:
+            memory_cache["img_pooled_op"] = memory_cache['img_memory'][0]
+            memory_cache["text_pooled_op"] = pooled_encoded_text
             memory_cache["text_pooled_op"] = self.contrastive_projection_text(memory_cache["text_pooled_op"])
             memory_cache["img_pooled_op"] = self.contrastive_projection_image(memory_cache["img_pooled_op"])
 
         return memory_cache
 
     def _decode(self, img_memory, text_memory, text_memory_resized, text_attention_mask, mask, query_embed, pos_embed, tokenized):
+        # cross-attend
         hs = self.transformer(
             mask=mask,
             query_embed=query_embed,
@@ -142,13 +175,13 @@ class MDETR(nn.Module):
             "pred_boxes": outputs_coord[-1],
         })
         
-        # 
+        # predict box is in the actual referred set.
         outputs_isfinal = None
         if self.isfinal_embed is not None:
             outputs_isfinal = self.isfinal_embed(hs)
             out["pred_isfinal"] = outputs_isfinal[-1]
 
-        # 
+        # box-token contrastive loss
         proj_queries, proj_tokens = None, None
         if self.contrastive_align_loss:
             proj_queries = F.normalize(self.contrastive_align_projection_image(hs), p=2, dim=-1)
@@ -158,6 +191,8 @@ class MDETR(nn.Module):
                 "proj_tokens": proj_tokens,
                 "tokenized": tokenized,
             })
+
+        # apply loss to each decoder layer
         if self.aux_loss:
             if self.contrastive_align_loss:
                 assert proj_tokens is not None and proj_queries is not None
@@ -297,10 +332,17 @@ def build(args):
     qa_dataset = validate_qa_dataset_choice(args)
     criterion, contrastive_criterion, qa_criterion = build_criterion(args, qa_dataset)
     weight_dict = build_weight_dict(args, qa_dataset)
+    
+    backbone = build_backbone(args)
+    text_encoder = build_text_encoder(args)
+    transformer = build_transformer(args)
+    pos_encode = build_position_encoding(args)
 
     model = MDETR(
-        build_backbone(args),
-        build_transformer(args),
+        backbone,
+        text_encoder,
+        transformer,
+        pos_encode=pos_encode,
         num_classes=args.num_classes,
         num_queries=args.num_queries,
         aux_loss=args.aux_loss,

@@ -43,15 +43,15 @@ class HFTextEncoder(nn.Module):
         text_memory_resized = self.resizer(text_memory)
         # Invert attention mask that we get from huggingface because its the opposite in pytorch transformer
         text_attention_mask = tokenized.attention_mask.ne(1).bool()
-        print(text_attention_mask.shape)
-        print(text_memory_resized.shape)
-        print(type(tokenized))
-        print(pooled_text.shape)
+        # print(text_attention_mask.shape)
+        # print(text_memory_resized.shape)
+        # print(type(tokenized))
+        # print(pooled_text.shape)
         # text_attention_mask: [batch, seq]
         # text_memory_resized: [seq, batch, resized_embedding]
         # tokenized: tokenization_utils_base.BatchEncoding
         # pooled_text: [batch, encoder_embedding]
-        return text_attention_mask, text_memory_resized, tokenized, pooled_text
+        return text_memory_resized, text_attention_mask, tokenized, pooled_text
 
 
 
@@ -92,3 +92,13 @@ class FeatureResizer(nn.Module):
             x = self.layer_norm(x)
         output = self.dropout(x)
         return output
+
+
+def build_text_encoder(args):
+    if args.text_model == "roberta":
+        model = RobertaTextEncoder(args.hidden_dim, args.text_encoder_type, args.freeze_text_encoder)
+    elif args.text_model == "clip":
+        model = ClipTextEncoder(args.hidden_dim, args.text_encoder_type, args.freeze_text_encoder)
+    else:
+        raise ValueError(f"Invalid text model: {args.text_model}")
+    return model

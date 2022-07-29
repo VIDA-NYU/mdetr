@@ -14,7 +14,6 @@ from typing import List, Optional, cast
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from .text_encoder import RobertaTextEncoder
 
 
 class Transformer(nn.Module):
@@ -30,8 +29,6 @@ class Transformer(nn.Module):
         normalize_before=False,
         return_intermediate_dec=False,
         pass_pos_and_query=True,
-        text_encoder_type="roberta-base",
-        freeze_text_encoder=False,
         contrastive_loss=False,
     ):
         super().__init__()
@@ -40,20 +37,20 @@ class Transformer(nn.Module):
         self.encoder = TransformerEncoder(
             TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout, activation, normalize_before), 
             num_encoder_layers, 
-            nn.LayerNorm(d_model) if normalize_before else None)
+            nn.LayerNorm(d_model) if normalize_before else None,
+            pass_pos_and_query=pass_pos_and_query)
 
         self.decoder = TransformerDecoder(
             TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation, normalize_before), 
             num_decoder_layers, 
             nn.LayerNorm(d_model), 
-            return_intermediate=return_intermediate_dec
+            return_intermediate=return_intermediate_dec,
+            pass_pos_and_query=pass_pos_and_query
         )
 
         self.cls_embed = nn.Embedding(1, d_model) if contrastive_loss else None
 
         self._reset_parameters()
-
-        self.text_encoder = RobertaTextEncoder(text_encoder_type, freeze_text_encoder)
 
         self.d_model = d_model
         self.nhead = nhead
@@ -63,7 +60,7 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def _encode(self, src, text, mask, query_embed, pos_embed: torch.Tensor):
+    def _encode(self, src, text_memory_resized, mask, text_attention_mask, query_embed, pos_embed: torch.Tensor):
         # flatten NxCxHxW to HWxNxC
         bs, c, h, w = src.shape
         src = src.flatten(2).permute(2, 0, 1)
@@ -75,42 +72,28 @@ class Transformer(nn.Module):
         if self.cls_embed is not None:
             # We add a CLS token to the image features, to be used for contrastive loss
             src = torch.cat((self.cls_embed.weight.view(1, 1, -1).repeat(1, bs, 1), src))
-            # Adding zeros as the first token in the sequence to be compatible with the CLS token
-            pos_embed = torch.cat((torch.zeros(1, bs, self.d_model, device=device), pos_embed))
-            # Adding one mask item to the beginning of the mask to be compatible with CLS token
             mask = torch.cat((torch.zeros(bs, 1).bool().to(device), mask), dim=1)
+            pos_embed = torch.cat((torch.zeros(1, bs, self.d_model, device=device), pos_embed))
 
-        if self.pass_pos_and_query:
-            tgt = torch.zeros_like(query_embed)
-        else:
-            src, tgt = src + 0.1 * pos_embed, query_embed
-
-        text_attention_mask, text_memory_resized, tokenized, pooled_encoded_text = self.text_encoder(text, src.device)
-
-        # Concat on the sequence dimension
+        # Concat image & text on the sequence dimension
         src = torch.cat([src, text_memory_resized], dim=0)
-        # For mask, sequence dimension is second
         mask = torch.cat([mask, text_attention_mask], dim=1)
-        # Pad the pos_embed with 0 so that the addition will be a no-op for the text tokens
         pos_embed = torch.cat([pos_embed, torch.zeros_like(text_memory_resized)], dim=0)
 
-        img_memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed if self.pass_pos_and_query else None)
-        text_memory = img_memory[-len(text_memory_resized) :]
+        # cross-attend image / text
+        img_memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        text_memory = img_memory[-len(text_memory_resized):]
 
-        assert img_memory.shape[1] == text_memory.shape[1] == tgt.shape[1]
-        memory_cache = {
+        assert img_memory.shape[1] == text_memory.shape[1] == query_embed.shape[1]  # batch
+        return {
             "text_memory_resized": text_memory_resized,
             "text_memory": text_memory,
             "img_memory": img_memory,
-            "text_pooled_op": pooled_encoded_text if self.cls_embed is not None else None,
-            "img_pooled_op": img_memory[0] if self.cls_embed is not None else None,  # Return the CLS token
             "mask": mask,
             "text_attention_mask": text_attention_mask,
-            "pos_embed": pos_embed if self.pass_pos_and_query else None,
-            "query_embed": query_embed if self.pass_pos_and_query else None,
-            "tokenized": tokenized,
+            "pos_embed": pos_embed,
+            "query_embed": query_embed,
         }
-        return memory_cache
 
     def _decode(
         self,
@@ -122,20 +105,14 @@ class Transformer(nn.Module):
         img_memory,
         text_attention_mask,
     ):
-        if self.pass_pos_and_query:
-            tgt = torch.zeros_like(query_embed)
-        else:
-            src, tgt = src + 0.1 * pos_embed, query_embed
-
-        assert img_memory.shape[1] == text_memory.shape[1] == tgt.shape[1]
+        assert img_memory.shape[1] == text_memory.shape[1] == query_embed.shape[1]  # batch
         hs = self.decoder(
-            tgt,
+            query_embed,
             img_memory,
             text_memory,
             memory_key_padding_mask=mask,
             text_memory_key_padding_mask=text_attention_mask,
-            pos=pos_embed if self.pass_pos_and_query else None,
-            query_pos=query_embed if self.pass_pos_and_query else None,
+            pos=pos_embed,
         )
         return hs.transpose(1, 2)
 
@@ -148,8 +125,9 @@ class Transformer(nn.Module):
         text_memory=None,
         img_memory=None,
         text_attention_mask=None,
-        text=None,
+        text_features=None,
         encode_and_save=True,
+        **memory_cache,  # catch extra params from memory_cache
     ):
         if encode_and_save:
             return self._encode(
@@ -157,7 +135,7 @@ class Transformer(nn.Module):
                 mask=mask,
                 query_embed=query_embed,
                 pos_embed=pos_embed,
-                text=text,
+                text_features=text_features,
             )
 
         else:
@@ -173,11 +151,12 @@ class Transformer(nn.Module):
 
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, encoder_layer, num_layers, norm=None):
+    def __init__(self, encoder_layer, num_layers, norm=None, pass_pos_and_query=True):
         super().__init__()
         self.layers = _get_clones(encoder_layer, num_layers)
         self.num_layers = num_layers
         self.norm = norm
+        self.pass_pos_and_query = pass_pos_and_query
 
     def forward(
         self,
@@ -186,6 +165,11 @@ class TransformerEncoder(nn.Module):
         src_key_padding_mask: Optional[Tensor] = None,
         pos: Optional[Tensor] = None,
     ):
+        # add positional embedding at the beginning?
+        if not self.pass_pos_and_query:
+            src = src + 0.1 * pos
+            pos = None
+
         output = src
         for layer in self.layers:
             output = layer(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask, pos=pos)
@@ -195,16 +179,18 @@ class TransformerEncoder(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, decoder_layer, num_layers, norm=None, return_intermediate=False):
+    def __init__(self, decoder_layer, num_layers, norm=None, 
+                 return_intermediate=False, pass_pos_and_query=True):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
         self.num_layers = num_layers
         self.norm = norm
         self.return_intermediate = return_intermediate
+        self.pass_pos_and_query = pass_pos_and_query
 
     def forward(
         self,
-        tgt,
+        query_pos,
         memory,
         text_memory,
         tgt_mask: Optional[Tensor] = None,
@@ -213,8 +199,14 @@ class TransformerDecoder(nn.Module):
         tgt_key_padding_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
         pos: Optional[Tensor] = None,
-        query_pos: Optional[Tensor] = None,
     ):
+        # add positional embedding at the beginning? or to every layer?
+        if self.pass_pos_and_query:
+            tgt = torch.zeros_like(query_pos)
+        else:
+            tgt = query_pos
+            pos = query_pos = None
+
         output = tgt
 
         intermediate = []
@@ -238,8 +230,7 @@ class TransformerDecoder(nn.Module):
         if self.norm is not None:
             output = self.norm(output)
             if self.return_intermediate:
-                intermediate.pop()
-                intermediate.append(output)
+                intermediate[-1] = output
 
         if self.return_intermediate:
             return torch.stack(intermediate)
@@ -466,8 +457,6 @@ def build_transformer(args):
         normalize_before=args.pre_norm,
         return_intermediate_dec=True,
         pass_pos_and_query=args.pass_pos_and_query,
-        text_encoder_type=args.text_encoder_type,
-        freeze_text_encoder=args.freeze_text_encoder,
         contrastive_loss=args.contrastive_loss,
     )
 
