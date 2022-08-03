@@ -15,7 +15,8 @@ import torch
 import torch.utils.data
 import torchvision
 from PIL import Image
-from transformers import RobertaTokenizerFast
+# from transformers import RobertaTokenizerFast
+from ..models.text_encoder import build_tokenizer
 
 import datasets.transforms as T
 
@@ -195,7 +196,7 @@ def build(dataset_file, image_set, args):
             ann_file,
             transforms=make_clevr_transforms(image_set, cautious=True),
         )
-    tokenizer = RobertaTokenizerFast.from_pretrained(args.text_encoder_type)
+    tokenizer = build_tokenizer(args)#RobertaTokenizerFast.from_pretrained(args.text_encoder_type)
 
     img_dir = Path(args.clevr_img_path) / f"{image_set}"
     ann_file = Path(args.clevr_ann_path) / f"{image_set}.json"

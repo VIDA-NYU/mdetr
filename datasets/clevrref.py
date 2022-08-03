@@ -6,13 +6,14 @@ from pathlib import Path
 
 import torch
 import torch.utils.data
-from transformers import RobertaTokenizerFast
+# from transformers import RobertaTokenizerFast
 
 import util.dist as dist
 from datasets.clevr import make_clevr_transforms
 from util.box_ops import generalized_box_iou
 
 from .coco import ModulatedDetection, make_coco_transforms
+from ..models.text_encoder import build_tokenizer
 
 
 class ClevrRefDetection(ModulatedDetection):
@@ -92,7 +93,8 @@ class ClevrRefEvaluator(object):
 
 
 def build(image_set, args):
-    tokenizer = RobertaTokenizerFast.from_pretrained(args.text_encoder_type)
+    # tokenizer = RobertaTokenizerFast.from_pretrained(args.text_encoder_type)
+    tokenizer = build_tokenizer(args)
 
     img_dir = Path(args.clevr_img_path) / f"{image_set}"
     ann_file = Path(args.clevr_ann_path) / f"{image_set}.json"

@@ -5,7 +5,8 @@ Data class for the PhraseCut dataset. The task considered is referring expressio
 
 from pathlib import Path
 
-from transformers import RobertaTokenizerFast
+# from transformers import RobertaTokenizerFast
+from ..models.text_encoder import build_tokenizer
 
 from .coco import ModulatedDetection, make_coco_transforms
 
@@ -30,7 +31,8 @@ def build(image_set, args):
     if args.test:
         ann_file = Path(args.phrasecut_ann_path) / f"finetune_phrasecut_test.json"
 
-    tokenizer = RobertaTokenizerFast.from_pretrained(args.text_encoder_type)
+    # tokenizer = RobertaTokenizerFast.from_pretrained(args.text_encoder_type)
+    tokenizer = build_tokenizer(args)
     dataset = PhrasecutDetection(
         img_dir,
         ann_file,

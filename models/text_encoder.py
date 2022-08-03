@@ -102,3 +102,14 @@ def build_text_encoder(args):
     else:
         raise ValueError(f"Invalid text model: {args.text_model}")
     return model
+
+def build_tokenizer(args):
+    if args.text_model == "roberta":
+        from transformers import RobertaTokenizerFast
+        tokenizer =  RobertaTokenizerFast.from_pretrained(args.text_encoder_type)
+    elif args.text_model == "clip":
+        from transformers import CLIPTokenizerFast
+        tokenizer = CLIPTokenizerFast.from_pretrained(args.text_encoder_type)
+    else:
+        raise ValueError(f"Invalid text tokenizer: {args.text_model}")
+    return tokenizer

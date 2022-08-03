@@ -5,7 +5,8 @@ from pathlib import Path
 
 import torch
 import torch.utils.data
-from transformers import RobertaTokenizerFast
+# from transformers import RobertaTokenizerFast
+from ..models.text_encoder import build_tokenizer
 
 import util.dist as dist
 from util.box_ops import generalized_box_iou
@@ -105,7 +106,8 @@ def build(image_set, args):
     else:
         assert False, f"{refexp_dataset_name} not a valid datasset name for refexp"
 
-    tokenizer = RobertaTokenizerFast.from_pretrained(args.text_encoder_type)
+    # tokenizer = RobertaTokenizerFast.from_pretrained(args.text_encoder_type)
+    tokenizer = build_tokenizer(args)
     dataset = RefExpDetection(
         img_dir,
         ann_file,
