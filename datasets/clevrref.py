@@ -13,7 +13,7 @@ from datasets.clevr import make_clevr_transforms
 from util.box_ops import generalized_box_iou
 
 from .coco import ModulatedDetection, make_coco_transforms
-from ..models.text_encoder import build_tokenizer
+from models.text_encoder import build_tokenizer
 
 
 class ClevrRefDetection(ModulatedDetection):

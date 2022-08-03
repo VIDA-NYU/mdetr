@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torchvision
 # from transformers import RobertaTokenizerFast
-from ..models.text_encoder import build_tokenizer
+from models.text_encoder import build_tokenizer
 
 from .coco import ConvertCocoPolysToMask, ModulatedDetection, make_coco_transforms
 

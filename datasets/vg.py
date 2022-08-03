@@ -7,7 +7,7 @@ Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references
 from pathlib import Path
 
 # from transformers import RobertaTokenizerFast
-from ..models.text_encoder import build_tokenizer
+from models.text_encoder import build_tokenizer
 
 from .coco import ModulatedDetection, make_coco_transforms
 

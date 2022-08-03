@@ -16,7 +16,7 @@ import torch.utils.data
 import torchvision
 from PIL import Image
 # from transformers import RobertaTokenizerFast
-from ..models.text_encoder import build_tokenizer
+from models.text_encoder import build_tokenizer
 
 import datasets.transforms as T
 

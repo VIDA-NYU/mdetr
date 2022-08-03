@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 import torch.utils.data
 # from transformers import RobertaTokenizerFast
-from ..models.text_encoder import build_tokenizer
+from models.text_encoder import build_tokenizer
 
 import util.dist as dist
 from util.box_ops import generalized_box_iou

@@ -5,7 +5,7 @@ Data class for the Flickr30k entities dataset. The task considered is phrase gro
 from pathlib import Path
 
 # from transformers import RobertaTokenizerFast
-from ..models.text_encoder import build_tokenizer
+from models.text_encoder import build_tokenizer
 
 from .coco import ModulatedDetection, make_coco_transforms
 

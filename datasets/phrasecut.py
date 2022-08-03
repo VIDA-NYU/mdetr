@@ -6,7 +6,7 @@ Data class for the PhraseCut dataset. The task considered is referring expressio
 from pathlib import Path
 
 # from transformers import RobertaTokenizerFast
-from ..models.text_encoder import build_tokenizer
+from models.text_encoder import build_tokenizer
 
 from .coco import ModulatedDetection, make_coco_transforms
 

@@ -12,7 +12,7 @@ from typing import Any, Callable, Optional, Tuple
 from PIL import Image
 from torchvision.datasets.vision import VisionDataset
 # from transformers import RobertaTokenizerFast
-from ..models.text_encoder import build_tokenizer
+from models.text_encoder import build_tokenizer
 
 from .coco import ConvertCocoPolysToMask, make_coco_transforms
 
